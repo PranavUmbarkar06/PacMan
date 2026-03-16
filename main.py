@@ -1,3 +1,10 @@
+#Run this if on a new system
+
+#import os
+
+#os.system("pip install -r requirements.txt")
+#Actual code
+
 import pygame
 import torch
 import numpy as np
