@@ -129,12 +129,10 @@ def main():
             pygame.draw.circle(screen, g_color, (g_pos[0]+13, g_pos[1]+13), 12)
 
         # --- 7. UI Overlay ---
-        status_text = "GHOST: STUNNED" if env.ghost_stunned_timer > 0 else "GHOST: HUNTING"
+        status_text = "GHOST: STUNNED" if env.ghost_stunned_timer > 0 else "GHOST: HUNTING" 
         status_color = (0, 255, 255) if env.ghost_stunned_timer > 0 else (255, 50, 50)
         
-        screen.blit(font.render(status_text, True, status_color), (15, 15))
-        screen.blit(font.render(f"P-Reward: {p_rew:.2f}", True, (255, 255, 255)), (15, 35))
-        screen.blit(font.render(f"Speed: 100% vs 50%", True, (200, 200, 200)), (15, 55))
+        
 
         pygame.display.flip()
         clock.tick(FPS)
