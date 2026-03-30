@@ -34,6 +34,7 @@ def build_arg_parser():
     parser.add_argument("--random-start-distance", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-path", type=str, default="p_brain.pth")
+    parser.add_argument("--resume-from", type=str, default=None, help="Load an existing model/checkpoint before training.")
     parser.add_argument("--cpu", action="store_true")
     return parser
 
@@ -54,6 +55,21 @@ def epsilon_by_step(step, start, end, decay_steps):
 def interpolate_schedule(episode_idx, total_episodes, start, end):
     progress = min(max(episode_idx, 0) / max(total_episodes, 1), 1.0)
     return start + (end - start) * progress
+
+
+def load_resume_checkpoint(path, policy_net, target_net, optimizer, device):
+    checkpoint = torch.load(path, map_location=device)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        policy_net.load_state_dict(checkpoint["model_state_dict"])
+        target_net.load_state_dict(checkpoint.get("target_model_state_dict", checkpoint["model_state_dict"]))
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        return checkpoint
+
+    policy_net.load_state_dict(checkpoint)
+    target_net.load_state_dict(checkpoint)
+    return {}
 
 
 def select_action(model, state, legal_actions, epsilon, device):
@@ -127,6 +143,16 @@ def train(args):
     best_score = (-1, -1, float("-inf"))
     total_wins = 0
     model_path = Path(args.model_path)
+
+    if args.resume_from:
+        resume_path = Path(args.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path.resolve()}")
+        checkpoint = load_resume_checkpoint(resume_path, policy_net, target_net, optimizer, device)
+        global_step = int(checkpoint.get("global_step", 0))
+        total_wins = int(checkpoint.get("total_wins", 0))
+        best_score = tuple(checkpoint.get("best_score", best_score))
+        print(f"Resumed training from {resume_path.resolve()}")
 
     for episode in range(1, args.episodes + 1):
         ghost_interval = round(
@@ -209,7 +235,16 @@ def train(args):
             torch.save(policy_net.state_dict(), model_path)
 
     target_net.load_state_dict(policy_net.state_dict())
+    checkpoint_payload = {
+        "model_state_dict": policy_net.state_dict(),
+        "target_model_state_dict": target_net.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "global_step": global_step,
+        "total_wins": total_wins,
+        "best_score": list(best_score),
+    }
     torch.save(target_net.state_dict(), model_path)
+    torch.save(checkpoint_payload, model_path.with_suffix(".ckpt"))
     print(f"Saved trained Pacman model to {model_path.resolve()}")
 
 
