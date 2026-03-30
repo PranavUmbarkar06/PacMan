@@ -1,167 +1,262 @@
-import numpy as np
+from collections import deque
 import random
-import heapq
 
-def get_a_star_action(env, is_ghost=True):
-    start = env.ghost_pos if is_ghost else env.pacman_pos
-    goal = env.pacman_pos if is_ghost else env.ghost_pos
-    
-    queue = [(0, start[0], start[1], [])]
-    visited = set([(start[0], start[1])])
-    
-    while queue:
-        dist, r, c, path = queue.pop(0)
-        if [r, c] == goal:
-            return path[0] if path else -1
-            
-        for a, (dr, dc) in env.moves.items():
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < 20 and 0 <= nc < 20 and env.board[nr, nc] != 2.0 and (nr, nc) not in visited:
-                visited.add((nr, nc))
-                queue.append((dist + 1, nr, nc, path + [a]))
-                
-    valid = env.get_valid_actions(start)
-    return random.choice(valid) if valid else 0
+import numpy as np
+
+
+ACTION_DELTAS = {
+    0: (-1, 0),  # up
+    1: (1, 0),   # down
+    2: (0, -1),  # left
+    3: (0, 1),   # right
+}
+
+
+def get_rule_based_ghost_action(env):
+    """Move along the shortest path to Pacman, or pick a valid fallback move."""
+    path = env.shortest_path(env.ghost_pos, env.pacman_pos)
+    if len(path) >= 2:
+        return env.action_from_positions(path[0], path[1])
+
+    valid_actions = env.get_valid_actions(env.ghost_pos)
+    return random.choice(valid_actions) if valid_actions else None
+
 
 class PacMan:
-    def __init__(self, board):
-        self.original_layout = np.array(board).astype(float) * 2.0
-        self.moves = {0: [-1, 0], 1: [1, 0], 2: [0, -1], 3: [0, 1]} # Up, Down, Left, Right
+    def __init__(self, layout, ghost_move_interval=2, ghost_start_delay=0, max_steps=500):
+        self.grid = np.array(layout, dtype=np.int8)
+        self.rows, self.cols = self.grid.shape
+        self.ghost_move_interval = ghost_move_interval
+        self.ghost_start_delay = ghost_start_delay
+        self.max_steps = max_steps
+        self.num_actions = len(ACTION_DELTAS)
         self.reset()
 
-    def reset(self):
-        self.board = np.copy(self.original_layout)
-        self.items = (self.original_layout == 0).astype(float) 
-        self.ghost_stunned_timer = 0
-        
-        # 1. Get all valid empty slots
-        empty_slots = np.argwhere(self.original_layout == 0).tolist()
-        
-        # 2. Define the four absolute corners of a 20x20 grid
-        corners = [[0, 0], [0, 19], [19, 0], [19, 19]]
-        
-        # 3. Find the closest valid empty slot for each corner
-        # This prevents the game from crashing if a corner is a wall
-        spawn_points = []
-        for corner in corners:
-            # Sort empty slots by distance to this specific corner
-            closest_slot = min(empty_slots, key=lambda s: abs(s[0]-corner[0]) + abs(s[1]-corner[1]))
-            spawn_points.append(closest_slot)
-            # Remove it from list so we don't pick the same spot twice
-            empty_slots.remove(closest_slot)
+    def configure_difficulty(self, ghost_move_interval=None, ghost_start_delay=None):
+        if ghost_move_interval is not None:
+            self.ghost_move_interval = max(1, int(ghost_move_interval))
+        if ghost_start_delay is not None:
+            self.ghost_start_delay = max(0, int(ghost_start_delay))
 
-        # 4. Assign positions (Top-Left, Top-Right, Bottom-Left, Bottom-Right)
-        # Let's put Pacman and Ghost at opposite diagonals
-        self.pacman_pos = spawn_points[0] # Top-Left
-        self.ghost_pos  = spawn_points[3] # Bottom-Right
-        self.stunner_pos = spawn_points[1] # Top-Right
-        self.bomb_pos    = spawn_points[2] # Bottom-Left
-        
-        # 5. Place special items on the items map
-        self.items[self.stunner_pos[0], self.stunner_pos[1]] = -1.0
-        self.items[self.bomb_pos[0], self.bomb_pos[1]] = -2.0
-        
+    def _random_open_cell(self, forbidden=None):
+        forbidden = set() if forbidden is None else set(forbidden)
+        candidates = [
+            (row, col)
+            for row in range(self.rows)
+            for col in range(self.cols)
+            if self.board[row, col] == 0 and (row, col) not in forbidden
+        ]
+        return random.choice(candidates)
+
+    def reset(self, randomize_positions=False, min_spawn_distance=8):
+        self.board = self.grid.copy()
+        if randomize_positions:
+            self.pacman_pos = self._random_open_cell()
+            self.ghost_pos = self._random_open_cell(forbidden={self.pacman_pos})
+            attempts = 0
+            while (
+                self.maze_distance(self.pacman_pos, self.ghost_pos) < min_spawn_distance
+                and attempts < 50
+            ):
+                self.ghost_pos = self._random_open_cell(forbidden={self.pacman_pos})
+                attempts += 1
+        else:
+            self.pacman_pos = self._closest_open_cell((1, 1))
+            self.ghost_pos = self._closest_open_cell((self.rows - 2, self.cols - 2))
+        self.pellets = {
+            (row, col)
+            for row in range(self.rows)
+            for col in range(self.cols)
+            if self.board[row, col] == 0
+        }
+        self.pellets.discard(self.pacman_pos)
+        self.pellets.discard(self.ghost_pos)
+        self.total_pellets = len(self.pellets)
+        self.steps = 0
+        self.ghost_tick = 0
+        self.no_pellet_steps = 0
+        self.previous_pacman_pos = self.pacman_pos
+        self.recent_positions = deque([self.pacman_pos], maxlen=8)
+        self.last_outcome = "running"
+        self._refresh_items()
         return self.get_state()
 
+    def _closest_open_cell(self, target):
+        open_cells = np.argwhere(self.board == 0)
+        best = min(open_cells, key=lambda pos: abs(pos[0] - target[0]) + abs(pos[1] - target[1]))
+        return (int(best[0]), int(best[1]))
+
+    def _refresh_items(self):
+        self.items = np.zeros_like(self.board, dtype=np.float32)
+        for row, col in self.pellets:
+            self.items[row, col] = 1.0
+
+    def in_bounds(self, position):
+        row, col = position
+        return 0 <= row < self.rows and 0 <= col < self.cols
+
+    def is_wall(self, position):
+        row, col = position
+        return self.board[row, col] == 1
+
+    def move(self, position, action_idx):
+        delta = ACTION_DELTAS[action_idx]
+        next_pos = (position[0] + delta[0], position[1] + delta[1])
+        if not self.in_bounds(next_pos) or self.is_wall(next_pos):
+            return position
+        return next_pos
+
+    def get_valid_actions(self, position):
+        valid = []
+        for action_idx in ACTION_DELTAS:
+            next_pos = self.move(position, action_idx)
+            if next_pos != position:
+                valid.append(action_idx)
+        return valid
+
+    def legal_action_mask(self, position=None):
+        position = self.pacman_pos if position is None else position
+        mask = np.zeros(self.num_actions, dtype=np.float32)
+        for action_idx in self.get_valid_actions(position):
+            mask[action_idx] = 1.0
+        return mask
+
+    def action_from_positions(self, start, end):
+        delta = (end[0] - start[0], end[1] - start[1])
+        for action_idx, action_delta in ACTION_DELTAS.items():
+            if action_delta == delta:
+                return action_idx
+        return None
+
+    def shortest_path(self, start, goal):
+        if start == goal:
+            return [start]
+
+        queue = deque([start])
+        parents = {start: None}
+
+        while queue:
+            current = queue.popleft()
+            for action_idx in ACTION_DELTAS:
+                nxt = self.move(current, action_idx)
+                if nxt == current or nxt in parents:
+                    continue
+                parents[nxt] = current
+                if nxt == goal:
+                    path = [goal]
+                    node = goal
+                    while parents[node] is not None:
+                        node = parents[node]
+                        path.append(node)
+                    path.reverse()
+                    return path
+                queue.append(nxt)
+
+        return [start]
+
+    def maze_distance(self, start, goal):
+        path = self.shortest_path(start, goal)
+        if path[-1] != goal:
+            return self.rows * self.cols
+        return len(path) - 1
+
+    def nearest_pellet_distance(self, position=None):
+        position = self.pacman_pos if position is None else position
+        if not self.pellets:
+            return 0
+        return min(self.maze_distance(position, pellet) for pellet in self.pellets)
+
+    def ghost_distance(self):
+        return self.maze_distance(self.pacman_pos, self.ghost_pos)
+
     def get_state(self):
-        state = np.zeros((6, 20, 20), dtype=np.float32)
-        # Channel 0: Walls
-        state[0] = (self.board == 2.0).astype(float)
-        # Channel 1: Pellets
-        state[1] = (self.items == 1.0).astype(float)
-        # Channel 2: Stunners
-        state[2] = (self.items == -1.0).astype(float)
-        # Channel 3: Bombs
-        state[3] = (self.items == -2.0).astype(float)
-        # Channel 4: Pacman
-        state[4, self.pacman_pos[0], self.pacman_pos[1]] = 1.0
-        # Channel 5: Ghost
-        state[5, self.ghost_pos[0], self.ghost_pos[1]] = 1.0
+        state = np.zeros((5, self.rows, self.cols), dtype=np.float32)
+        state[0] = (self.board == 1).astype(np.float32)
+
+        for row, col in self.pellets:
+            state[1, row, col] = 1.0
+
+        state[2, self.pacman_pos[0], self.pacman_pos[1]] = 1.0
+        state[3, self.ghost_pos[0], self.ghost_pos[1]] = 1.0
+        if self.ghost_tick % self.ghost_move_interval == self.ghost_move_interval - 1:
+            state[4].fill(1.0)
+
         return state
 
-    def get_a_star_distance(self, start, goal):
-        # A simple BFS/A* to get exactly shortest path length considering walls
-        queue = [(0, start[0], start[1])]
-        visited = set([(start[0], start[1])])
-        while queue:
-            dist, r, c = queue.pop(0)
-            if [r, c] == goal:
-                return dist
-            for dr, dc in [[-1, 0], [1, 0], [0, -1], [0, 1]]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < 20 and 0 <= nc < 20 and self.board[nr, nc] != 2.0 and (nr, nc) not in visited:
-                    visited.add((nr, nc))
-                    queue.append((dist + 1, nr, nc))
-        return 999 # Fallback if unreachable
+    def step(self, pacman_action):
+        self.steps += 1
+        reward = 0.0
+        done = False
+        info = {
+            "pellets_remaining": len(self.pellets),
+            "ghost_moved": False,
+            "outcome": "running",
+        }
 
+        valid_actions = self.get_valid_actions(self.pacman_pos)
+        old_pellet_distance = self.nearest_pellet_distance()
+        old_ghost_distance = self.ghost_distance()
+        old_position = self.pacman_pos
 
-    def get_valid_actions(self, pos):
-        """Hard Rule: Filter out any action that leads to a wall (2.0)"""
-        valid = []
-        for action, (dr, dc) in self.moves.items():
-            nr, nc = pos[0] + dr, pos[1] + dc
-            if 0 <= nr < 20 and 0 <= nc < 20 and self.board[nr, nc] != 2.0:
-                valid.append(action)
-        return valid if valid else [0] # Safety fallback
+        if pacman_action not in valid_actions:
+            reward -= 0.2
+        self.pacman_pos = self.move(self.pacman_pos, pacman_action)
 
-    def step(self, p_action, g_action):
-        # Use A* distance for better reward shaping
-        d_old = self.get_a_star_distance(self.pacman_pos, self.ghost_pos)
-        p_reward, g_reward, done = -0.1, -0.1, False # Reduced step penalty to ease exploration
-
-        # --- Pacman Movement ---
-        if p_action in self.get_valid_actions(self.pacman_pos):
-            p_dr, p_dc = self.moves[p_action]
-            self.pacman_pos = [self.pacman_pos[0] + p_dr, self.pacman_pos[1] + p_dc]
-            val = self.items[self.pacman_pos[0], self.pacman_pos[1]]
-            if val == 1.0: 
-                p_reward += 10.0
-                self.items[self.pacman_pos[0], self.pacman_pos[1]] = 0
-            elif val == -1.0:
-                p_reward += 30.0
-                self.ghost_stunned_timer = 20
-                self.items[self.pacman_pos[0], self.pacman_pos[1]] = 0
-            elif val == -2.0:
-                p_reward += 50.0
-                done = True 
+        if self.pacman_pos in self.pellets:
+            self.pellets.remove(self.pacman_pos)
+            reward += 10.0
+            self.no_pellet_steps = 0
         else:
-             p_reward -= 1.0 # Penalty for hitting a wall
+            reward -= 0.1
+            self.no_pellet_steps += 1
 
-        # --- Ghost Movement ---
-        if self.ghost_stunned_timer > 0:
-            self.ghost_stunned_timer -= 1
-        elif g_action in self.get_valid_actions(self.ghost_pos):
-            g_dr, g_dc = self.moves[g_action]
-            self.ghost_pos = [self.ghost_pos[0] + g_dr, self.ghost_pos[1] + g_dc]
-        else:
-             g_reward -= 1.0 # Penalty for hitting a wall
+        new_pellet_distance = self.nearest_pellet_distance()
+        if new_pellet_distance < old_pellet_distance:
+            reward += 0.25 * (old_pellet_distance - new_pellet_distance)
 
-        # --- Vectorized Shaping ---
-        d_new = self.get_a_star_distance(self.pacman_pos, self.ghost_pos)
-        
-        # Ghost Reward Shaping: Reward for getting closer to Pacman
-        if self.ghost_stunned_timer == 0:
-            if d_new < d_old:
-                g_reward += 2.0
-            elif d_new > d_old:
-                g_reward -= 2.0
+        if self.pacman_pos == old_position:
+            reward -= 0.2
+        elif self.pacman_pos == self.previous_pacman_pos:
+            reward -= 0.15
+        elif self.pacman_pos in self.recent_positions:
+            reward -= 0.05
 
-
-        # --- Conflicts ---
         if self.pacman_pos == self.ghost_pos:
-            if self.ghost_stunned_timer == 0:
-                p_reward -= 30; g_reward += 30; done = True
-            else:
-                p_reward += 50; g_reward -= 50
-                empty_slots = np.argwhere(self.board == 0).tolist()
-                self.ghost_pos = random.choice(empty_slots)
+            reward -= 450.0
+            done = True
+            info["outcome"] = "caught"
+        else:
+            self.ghost_tick += 1
+            if self.steps > self.ghost_start_delay and self.ghost_tick % self.ghost_move_interval == 0:
+                ghost_action = get_rule_based_ghost_action(self)
+                if ghost_action is not None:
+                    self.ghost_pos = self.move(self.ghost_pos, ghost_action)
+                    info["ghost_moved"] = True
 
-        if not np.any(self.items == 1.0):
-            p_reward += 100; done = True
+            new_ghost_distance = self.ghost_distance()
+            if new_ghost_distance > old_ghost_distance:
+                reward += 0.3 * (new_ghost_distance - old_ghost_distance)
+            if new_ghost_distance <= 2:
+                reward += 0.1 * max(new_ghost_distance - old_ghost_distance, 0)
 
-        return self.get_state(), p_reward, g_reward, done
-    
+            if self.pacman_pos == self.ghost_pos:
+                reward -= 450.0
+                done = True
+                info["outcome"] = "caught"
 
+        if not done and not self.pellets:
+            reward += 500.0
+            done = True
+            info["outcome"] = "cleared"
 
+        if not done and self.steps >= self.max_steps:
+            done = True
+            info["outcome"] = "timeout"
 
+        self.last_outcome = info["outcome"]
+        self.previous_pacman_pos = old_position
+        self.recent_positions.append(self.pacman_pos)
+        info["pellets_remaining"] = len(self.pellets)
+        self._refresh_items()
 
+        return self.get_state(), reward, done, info

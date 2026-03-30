@@ -1,191 +1,217 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import numpy as np
-import os
-from Models import Brain, Game
-from Models.Game import get_a_star_action
-from map import LAYOUT
+import argparse
 import random
-import copy
+from pathlib import Path
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import numpy as np
+import torch
+import torch.optim as optim
 
-# Two Brains + Two Target Networks for stability
-p_brain = Brain.Brain().to(device)
-p_target = copy.deepcopy(p_brain)
-g_brain = Brain.Brain().to(device)
-g_target = copy.deepcopy(g_brain)
+from map import LAYOUT
+from Models.Brain import Brain, ReplayMemory, huber_loss
+from Models.Game import PacMan
 
-p_opt = optim.Adam(p_brain.parameters(), lr=0.00025)
-g_opt = optim.Adam(g_brain.parameters(), lr=0.00025)
 
-p_mem = Brain.ReplayMemory()
-g_mem = Brain.ReplayMemory()
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Train a Pacman DQN with a rule-based ghost.")
+    parser.add_argument("--episodes", type=int, default=400)
+    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lr", type=float, default=2.5e-4)
+    parser.add_argument("--replay-size", type=int, default=100_000)
+    parser.add_argument("--warmup-steps", type=int, default=2_000)
+    parser.add_argument("--train-every", type=int, default=4)
+    parser.add_argument("--target-update", type=int, default=1_000)
+    parser.add_argument("--epsilon-start", type=float, default=1.0)
+    parser.add_argument("--epsilon-end", type=float, default=0.1)
+    parser.add_argument("--epsilon-decay-steps", type=int, default=12_000)
+    parser.add_argument("--ghost-interval-start", type=int, default=5)
+    parser.add_argument("--ghost-interval-end", type=int, default=2)
+    parser.add_argument("--ghost-delay-start", type=int, default=40)
+    parser.add_argument("--ghost-delay-end", type=int, default=0)
+    parser.add_argument("--curriculum-episodes", type=int, default=0, help="0 scales automatically with total episodes.")
+    parser.add_argument("--reward-clip", type=float, default=1.0, help="Clip rewards to +/- this value for DQN updates.")
+    parser.add_argument("--random-start-distance", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model-path", type=str, default="p_brain.pth")
+    parser.add_argument("--cpu", action="store_true")
+    return parser
 
-gamma, batch_size = 0.99, 64
-target_update = 1000 # Increased for stability
-UPDATE_EVERY = 4 # Speed Optimization: Update networks every 4 steps
 
-def get_action(brain, state, env, pos, eps):
-    valid = env.get_valid_actions(pos)
-    if random.random() < eps:
-        return random.choice(valid)
-    
-    state_t = torch.FloatTensor(state).unsqueeze(0).to(device)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def epsilon_by_step(step, start, end, decay_steps):
+    progress = min(step / max(decay_steps, 1), 1.0)
+    return start + progress * (end - start)
+
+
+def interpolate_schedule(episode_idx, total_episodes, start, end):
+    progress = min(max(episode_idx, 0) / max(total_episodes, 1), 1.0)
+    return start + (end - start) * progress
+
+
+def select_action(model, state, legal_actions, epsilon, device):
+    if random.random() < epsilon:
+        return random.choice(legal_actions)
+
+    state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        q_values = brain(state_t).cpu().numpy()[0]
-    
-    # Masking: set illegal moves to -infinity
-    mask = np.full(4, -np.inf)
-    for a in valid: mask[a] = q_values[a]
-    return np.argmax(mask)
+        q_values = model(state_tensor)[0].cpu().numpy()
 
-def optimize(brain, target, optimizer, memory):
-    if len(memory.memory) < batch_size: return
-    s, a, r, ns, d = zip(*memory.sample(batch_size))
+    masked_q = np.full_like(q_values, -np.inf)
+    for action in legal_actions:
+        masked_q[action] = q_values[action]
+    return int(masked_q.argmax())
 
-    s = torch.FloatTensor(np.array(s)).to(device)
-    a = torch.LongTensor(a).to(device)
-    r = torch.FloatTensor(r).to(device)
-    ns = torch.FloatTensor(np.array(ns)).to(device)
-    d = torch.FloatTensor(d).to(device)
 
-    current_q = brain(s).gather(1, a.unsqueeze(1)).squeeze()
-    
-    # --- Double DQN ---
-    # 1. Use online network to select best action
+def optimize_model(model, target_model, optimizer, memory, batch_size, gamma, device):
+    if len(memory) < batch_size:
+        return None
+
+    transitions = memory.sample(batch_size)
+    states, actions, rewards, next_states, dones, next_masks = zip(*transitions)
+
+    states = torch.tensor(np.array(states), dtype=torch.float32, device=device)
+    actions = torch.tensor(actions, dtype=torch.int64, device=device)
+    rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+    next_states = torch.tensor(np.array(next_states), dtype=torch.float32, device=device)
+    dones = torch.tensor(dones, dtype=torch.float32, device=device)
+    next_masks = torch.tensor(np.array(next_masks), dtype=torch.float32, device=device)
+
+    current_q = model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
     with torch.no_grad():
-        best_next_actions = brain(ns).argmax(1).unsqueeze(1)
-        # 2. Use target network to evaluate best action
-        next_q = target(ns).gather(1, best_next_actions).squeeze()
-        
-    expected_q = r + (gamma * next_q * (1 - d))
+        online_next_q = model(next_states).masked_fill(next_masks <= 0, float("-inf"))
+        best_next_actions = online_next_q.argmax(dim=1, keepdim=True)
+        target_next_q = target_model(next_states).gather(1, best_next_actions).squeeze(1)
+        best_next_q = torch.where(
+            torch.isfinite(target_next_q),
+            target_next_q,
+            torch.zeros_like(target_next_q),
+        )
+        target_q = rewards + gamma * best_next_q * (1.0 - dones)
 
-    # Huber Loss is better for outliers than MSE
-    loss = F.smooth_l1_loss(current_q, expected_q)
+    loss = huber_loss(current_q, target_q)
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
     optimizer.step()
-    return loss.item()
-
-env = Game.PacMan(LAYOUT)
-steps = 0
-
-try:
-    # ==========================================
-    # STAGE 1: Train Pacman vs A* Ghost
-    # ==========================================
-    print("--- STAGE 1: Training Pacman vs A* Ghost ---")
-    epsilon_p = 1.0
-    eps_decay_p = 0.995 # Faster decay
-    eps_min = 0.05
-    
-    for episode in range(800): # 800 episodes for Stage 1
-        state = env.reset() 
-        done, p_total = False, 0
-        p_losses = []
-        episode_steps = 0
-        
-        while not done:
-            # Pacman uses Neural Net
-            p_act = get_action(p_brain, state, env, env.pacman_pos, epsilon_p)
-            
-            # Ghost uses A* Rule (Half speed - only moves every 2 frames)
-            if steps % 2 == 0:
-                g_act = get_a_star_action(env, is_ghost=True)
-            else:
-                g_act = 99
-
-            next_state, p_rew, g_rew, done = env.step(p_act, g_act)
-            p_mem.push(state, p_act, p_rew, next_state, done)
-
-            episode_steps += 1
-            if episode_steps >= 1000: # Time limit
-                done = True
-
-            if steps % UPDATE_EVERY == 0:
-                loss = optimize(p_brain, p_target, p_opt, p_mem)
-                if loss: p_losses.append(loss)
-
-            state = next_state
-            p_total += p_rew; steps += 1
-
-            if steps % target_update == 0:
-                p_target.load_state_dict(p_brain.state_dict())
-
-        epsilon_p = max(eps_min, epsilon_p * eps_decay_p)
-        avg_loss = np.mean(p_losses) if p_losses else 0
-        if episode % 10 == 0:
-            print(f"S1 Ep {episode:3} | P-Rew: {p_total:6.1f} | Eps P: {epsilon_p:.2f} | Avg Loss: {avg_loss:.4f} | Steps: {episode_steps}")
-
-    print("Stage 1 Complete.")
+    return float(loss.item())
 
 
-    # ==========================================
-    # STAGE 2: Train Ghost vs Trained Pacman
-    # ==========================================
-    # p_brain weights are already in memory, switch to evaluation
-    p_brain.eval() 
-    print("\n--- STAGE 2: Training Ghost vs Trained Pacman ---")
-    
-    epsilon_g = 1.0
-    eps_decay_g = 0.995
-    eps_min = 0.05
+def train(args):
+    set_seed(args.seed)
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    env = PacMan(
+        LAYOUT,
+        ghost_move_interval=args.ghost_interval_start,
+        ghost_start_delay=args.ghost_delay_start,
+        max_steps=args.max_steps,
+    )
 
-    # Curriculum Learning: Start with noisy Pacman
-    curriculum_eps_p = 0.3 
-    curriculum_decay = 0.99 
-    MAX_EPISODE_STEPS = 1000 # Force reset if the game lasts too long
-    
-    for episode in range(800): 
-        state = env.reset() 
-        done, g_total = False, 0
-        g_losses = []
-        episode_steps = 0
-        
-        while not done:
-            p_act = get_action(p_brain, state, env, env.pacman_pos, curriculum_eps_p)
-            
-            if steps % 2 == 0:
-                g_act = get_action(g_brain, state, env, env.ghost_pos, epsilon_g)
-            else:
-                g_act = 99
+    policy_net = Brain(input_channels=5, num_actions=env.num_actions).to(device)
+    target_net = Brain(input_channels=5, num_actions=env.num_actions).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
 
-            next_state, p_rew, g_rew, done = env.step(p_act, g_act)
-            
-            episode_steps += 1
-            if episode_steps >= MAX_EPISODE_STEPS: # Time limit
-                done = True
+    optimizer = optim.Adam(policy_net.parameters(), lr=args.lr)
+    memory = ReplayMemory(capacity=args.replay_size)
 
-            if g_act != 99:
-                 g_mem.push(state, g_act, g_rew, next_state, done)
+    global_step = 0
+    curriculum_episodes = args.curriculum_episodes or max(int(args.episodes * 0.8), 1)
+    best_score = (-1, -1, float("-inf"))
+    total_wins = 0
+    model_path = Path(args.model_path)
 
-            if steps % UPDATE_EVERY == 0:
-                loss = optimize(g_brain, g_target, g_opt, g_mem)
-                if loss: g_losses.append(loss)
+    for episode in range(1, args.episodes + 1):
+        ghost_interval = round(
+            interpolate_schedule(
+                episode - 1,
+                curriculum_episodes,
+                args.ghost_interval_start,
+                args.ghost_interval_end,
+            )
+        )
+        ghost_delay = round(
+            interpolate_schedule(
+                episode - 1,
+                curriculum_episodes,
+                args.ghost_delay_start,
+                args.ghost_delay_end,
+            )
+        )
+        env.configure_difficulty(
+            ghost_move_interval=ghost_interval,
+            ghost_start_delay=ghost_delay,
+        )
+        state = env.reset(randomize_positions=True, min_spawn_distance=args.random_start_distance)
+        episode_reward = 0.0
+        losses = []
+
+        for _ in range(args.max_steps):
+            epsilon = epsilon_by_step(
+                global_step,
+                args.epsilon_start,
+                args.epsilon_end,
+                args.epsilon_decay_steps,
+            )
+            legal_actions = env.get_valid_actions(env.pacman_pos)
+            action = select_action(policy_net, state, legal_actions, epsilon, device)
+
+            next_state, reward, done, info = env.step(action)
+            next_mask = env.legal_action_mask()
+            clipped_reward = float(np.clip(reward, -args.reward_clip, args.reward_clip))
+            memory.push(state, action, clipped_reward, next_state, done, next_mask)
 
             state = next_state
-            g_total += g_rew
-            steps += 1
+            episode_reward += reward
+            global_step += 1
 
-            if steps % target_update == 0:
-                g_target.load_state_dict(g_brain.state_dict())
+            if global_step >= args.warmup_steps and global_step % args.train_every == 0:
+                loss = optimize_model(
+                    policy_net,
+                    target_net,
+                    optimizer,
+                    memory,
+                    args.batch_size,
+                    args.gamma,
+                    device,
+                )
+                if loss is not None:
+                    losses.append(loss)
 
-        epsilon_g = max(eps_min, epsilon_g * eps_decay_g)
-        curriculum_eps_p = max(0.01, curriculum_eps_p * curriculum_decay)
-        
-        if episode % 10 == 0:
-            avg_loss = np.mean(g_losses) if g_losses else 0
-            print(f"S2 Ep {episode:3} | G-Rew: {g_total:6.1f} | Eps G: {epsilon_g:.2f} | Avg Loss: {avg_loss:.4f} | Steps: {episode_steps}")
+            if global_step % args.target_update == 0:
+                target_net.load_state_dict(policy_net.state_dict())
 
-except KeyboardInterrupt:
-    print("\nTraining interrupted by user. Saving progress...")
+            if done:
+                break
 
-finally:
-    # This block runs whether the loop finishes naturally OR is interrupted
-    print("Saving models...")
-    torch.save(p_brain.state_dict(), "p_brain.pth")
-    torch.save(g_brain.state_dict(), "g_brain.pth")
-    print("Done. Models saved to p_brain.pth and g_brain.pth")
+        avg_loss = float(np.mean(losses)) if losses else 0.0
+        pellets_left = info["pellets_remaining"]
+        pellets_eaten = env.total_pellets - pellets_left
+        win = int(info["outcome"] == "cleared")
+        total_wins += win
+        print(
+            f"Ep {episode:04d} | reward {episode_reward:8.2f} | "
+            f"loss {avg_loss:7.4f} | epsilon {epsilon:5.3f} | "
+            f"eaten {pellets_eaten:3d} | left {pellets_left:3d} | "
+            f"ghost {ghost_interval}t/{ghost_delay}d | wins {total_wins:3d} | outcome {info['outcome']}"
+        )
+
+        episode_score = (win, pellets_eaten, episode_reward)
+        if episode_score > best_score:
+            best_score = episode_score
+            torch.save(policy_net.state_dict(), model_path)
+
+    target_net.load_state_dict(policy_net.state_dict())
+    torch.save(target_net.state_dict(), model_path)
+    print(f"Saved trained Pacman model to {model_path.resolve()}")
+
+
+if __name__ == "__main__":
+    train(build_arg_parser().parse_args())

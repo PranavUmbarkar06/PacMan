@@ -1,117 +1,128 @@
+import argparse
+import random
+from pathlib import Path
+
 import pygame
 import torch
-import numpy as np
-import random
-import os
-from Models.Brain import Brain
-from Models.Game import PacMan, get_a_star_action 
-from map import LAYOUT
 
-# Constants
+from map import LAYOUT
+from Models.Brain import Brain
+from Models.Game import PacMan
+
+
 TILE_SIZE = 30
-FPS = 5 
-GHOST_SPEED_DIVIDER = 2  # Ghost moves once every N frames. Increase to slow him down further.
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Watch a trained Pacman agent.")
+    parser.add_argument("--model-path", type=str, default="p_brain.pth")
+    parser.add_argument("--fps", type=int, default=8)
+    parser.add_argument("--episodes", type=int, default=0, help="0 means run until the window is closed.")
+    parser.add_argument("--epsilon", type=float, default=0.1, help="Exploration rate for evaluation runs.")
+    parser.add_argument("--cpu", action="store_true")
+    return parser.parse_args()
+
+
+def choose_action(model, env, state, device, epsilon):
+    legal_actions = env.get_valid_actions(env.pacman_pos)
+    if random.random() < epsilon:
+        return random.choice(legal_actions)
+
+    state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        q_values = model(state_tensor)[0].cpu()
+
+    best_action = max(legal_actions, key=lambda action: q_values[action].item())
+    return int(best_action)
+
+
+def draw_env(screen, env):
+    screen.fill((0, 0, 0))
+
+    for row in range(env.rows):
+        for col in range(env.cols):
+            rect = pygame.Rect(col * TILE_SIZE, row * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+            if env.board[row, col] == 1:
+                pygame.draw.rect(screen, (33, 33, 255), rect, 2)
+            elif env.items[row, col] == 1.0:
+                pygame.draw.circle(screen, (255, 214, 160), rect.center, 3)
+
+    pac_rect = pygame.Rect(
+        env.pacman_pos[1] * TILE_SIZE + 3,
+        env.pacman_pos[0] * TILE_SIZE + 3,
+        TILE_SIZE - 6,
+        TILE_SIZE - 6,
+    )
+    ghost_rect = pygame.Rect(
+        env.ghost_pos[1] * TILE_SIZE + 3,
+        env.ghost_pos[0] * TILE_SIZE + 3,
+        TILE_SIZE - 6,
+        TILE_SIZE - 6,
+    )
+
+    pygame.draw.ellipse(screen, (255, 230, 0), pac_rect)
+    pygame.draw.circle(screen, (255, 60, 60), ghost_rect.center, (TILE_SIZE - 6) // 2)
+
 
 def main():
-    pygame.init()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    args = parse_args()
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+
     env = PacMan(LAYOUT)
-    screen = pygame.display.set_mode((20 * TILE_SIZE, 20 * TILE_SIZE))
-    pygame.display.set_caption("Neural Pacman vs Slow A* Ghost")
+    model = Brain(input_channels=5, num_actions=env.num_actions).to(device)
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model not found at {model_path.resolve()}. Train first with `python train.py`."
+        )
+
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "The saved model does not match the new paper-style DQN architecture. "
+            "Run `python train.py` to generate a fresh checkpoint."
+        ) from exc
+    model.eval()
+
+    pygame.init()
+    screen = pygame.display.set_mode((env.cols * TILE_SIZE, env.rows * TILE_SIZE))
+    pygame.display.set_caption("Pacman DQN vs Rule-Based Ghost")
     clock = pygame.time.Clock()
 
-    # --- 1. Load Images ---
-    try:
-        p_img_orig = pygame.image.load("pacman.png").convert_alpha()
-        g_img_orig = pygame.image.load("ghost.png").convert_alpha()
-        p_img_orig = pygame.transform.scale(p_img_orig, (26, 26))
-        g_img_orig = pygame.transform.scale(g_img_orig, (26, 26))
-        using_custom_imgs = True
-    except pygame.error:
-        using_custom_imgs = False
-
-    # --- 2. Load Neural Brain ---
-    p_brain = Brain().to(device)
-    if os.path.exists("p_brain.pth"):
-        p_brain.load_state_dict(torch.load("p_brain.pth", map_location=device, weights_only=True))
-        print("Loaded Pacman Neural Network.")
-    else:
-        print("Warning: p_brain.pth not found. Pacman will act randomly.")
-    
-    p_brain.eval()
-
-    frame_counter = 0
+    episode = 0
+    state = env.reset()
     running = True
+    episode_reward = 0.0
 
     while running:
-        frame_counter += 1
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
-        # --- 3. Decision Making ---
-        state = env.get_state()
-        state_t = torch.FloatTensor(state).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            # Pacman Logic: Always moves based on the Brain
-            p_action = p_brain(state_t).argmax().item()
-            
-            # Ghost Logic: Only moves every Nth frame (controlled by GHOST_SPEED_DIVIDER)
-            if frame_counter % GHOST_SPEED_DIVIDER == 0:
-                g_action = get_a_star_action(env, is_ghost=True)
-            else:
-                g_action = -1 # Signal to the environment to stay still
+        action = choose_action(model, env, state, device, args.epsilon)
+        state, reward, done, info = env.step(action)
+        episode_reward += reward
 
-        # --- 4. Step Environment ---
-        _, p_rew, _, done = env.step(p_action, g_action)
-        
-        if done:
-            print(f"Game Over! Pacman Reward: {p_rew:.2f}")
-            pygame.time.delay(800) 
-            env.reset()
-            frame_counter = 0
-
-        # --- 5. Rendering ---
-        screen.fill((0, 0, 0))
-        
-        for r in range(20):
-            for c in range(20):
-                rect = (c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE)
-                if env.board[r, c] == 2.0: # Wall
-                    pygame.draw.rect(screen, (33, 33, 255), rect, 2)
-                elif env.items[r, c] == 1.0: # Pellet
-                    pygame.draw.circle(screen, (255, 184, 151), (c*TILE_SIZE+15, r*TILE_SIZE+15), 2)
-                elif env.items[r, c] == -1.0: # Stunner
-                    pygame.draw.circle(screen, (0, 255, 0), (c*TILE_SIZE+15, r*TILE_SIZE+15), 6)
-                elif env.items[r, c] == -2.0: # Bomb
-                    pygame.draw.circle(screen, (255, 0, 0), (c*TILE_SIZE+15, r*TILE_SIZE+15), 6)
-
-        # Draw Agents
-        p_pos = (env.pacman_pos[1]*TILE_SIZE+2, env.pacman_pos[0]*TILE_SIZE+2)
-        g_pos = (env.ghost_pos[1]*TILE_SIZE+2, env.ghost_pos[0]*TILE_SIZE+2)
-
-        if using_custom_imgs:
-            angles = [90, 270, 0, 180] # Up, Down, Left, Right
-            rot_p = pygame.transform.rotate(p_img_orig, angles[p_action])
-            screen.blit(rot_p, p_pos)
-            
-            # Only update ghost rotation if he actually moved
-            g_draw_angle = angles[g_action] if g_action != -1 else 0
-            rot_g = pygame.transform.rotate(g_img_orig, g_draw_angle)
-            if env.ghost_stunned_timer > 0:
-                rot_g.fill((100, 100, 255, 128), special_flags=pygame.BLEND_RGBA_MULT)
-            screen.blit(rot_g, g_pos)
-        else:
-            pygame.draw.circle(screen, (255, 255, 0), (p_pos[0]+13, p_pos[1]+13), 12)
-            g_color = (100, 100, 255) if env.ghost_stunned_timer > 0 else (255, 0, 0)
-            pygame.draw.circle(screen, g_color, (g_pos[0]+13, g_pos[1]+13), 12)
-
+        draw_env(screen, env)
         pygame.display.flip()
-        clock.tick(FPS)
+        clock.tick(args.fps)
+
+        if done:
+            episode += 1
+            print(
+                f"Episode {episode} finished | reward {episode_reward:7.2f} | "
+                f"pellets left {info['pellets_remaining']} | outcome {info['outcome']}"
+            )
+            if args.episodes and episode >= args.episodes:
+                break
+            pygame.time.delay(750)
+            state = env.reset()
+            episode_reward = 0.0
 
     pygame.quit()
+
 
 if __name__ == "__main__":
     main()
