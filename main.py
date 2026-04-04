@@ -25,10 +25,12 @@ def parse_args():
 
 def choose_action(model, env, state, device, epsilon):
     legal_actions = env.get_valid_actions(env.pacman_pos)
+
     if random.random() < epsilon:
         return random.choice(legal_actions)
 
     state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+
     with torch.no_grad():
         q_values = model(state_tensor)[0].cpu()
 
@@ -36,32 +38,41 @@ def choose_action(model, env, state, device, epsilon):
     return int(best_action)
 
 
-def draw_env(screen, env):
+def load_images():
+    pacman_img = pygame.image.load("pacman.png").convert_alpha()
+    ghost_img = pygame.image.load("ghost.png").convert_alpha()
+
+    pacman_img = pygame.transform.scale(pacman_img, (TILE_SIZE - 6, TILE_SIZE - 6))
+    ghost_img = pygame.transform.scale(ghost_img, (TILE_SIZE - 6, TILE_SIZE - 6))
+
+    return pacman_img, ghost_img
+
+
+def draw_env(screen, env, pacman_img, ghost_img):
     screen.fill((0, 0, 0))
 
     for row in range(env.rows):
         for col in range(env.cols):
             rect = pygame.Rect(col * TILE_SIZE, row * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+
+            # Walls
             if env.board[row, col] == 1:
                 pygame.draw.rect(screen, (33, 33, 255), rect, 2)
+
+            # Pellets
             elif env.items[row, col] == 1.0:
                 pygame.draw.circle(screen, (255, 214, 160), rect.center, 3)
 
-    pac_rect = pygame.Rect(
-        env.pacman_pos[1] * TILE_SIZE + 3,
-        env.pacman_pos[0] * TILE_SIZE + 3,
-        TILE_SIZE - 6,
-        TILE_SIZE - 6,
-    )
-    ghost_rect = pygame.Rect(
-        env.ghost_pos[1] * TILE_SIZE + 3,
-        env.ghost_pos[0] * TILE_SIZE + 3,
-        TILE_SIZE - 6,
-        TILE_SIZE - 6,
-    )
+    # Pacman position
+    pac_x = env.pacman_pos[1] * TILE_SIZE + 3
+    pac_y = env.pacman_pos[0] * TILE_SIZE + 3
 
-    pygame.draw.ellipse(screen, (255, 230, 0), pac_rect)
-    pygame.draw.circle(screen, (255, 60, 60), ghost_rect.center, (TILE_SIZE - 6) // 2)
+    # Ghost position
+    ghost_x = env.ghost_pos[1] * TILE_SIZE + 3
+    ghost_y = env.ghost_pos[0] * TILE_SIZE + 3
+
+    screen.blit(pacman_img, (pac_x, pac_y))
+    screen.blit(ghost_img, (ghost_x, ghost_y))
 
 
 def main():
@@ -84,12 +95,16 @@ def main():
             "The saved model does not match the new paper-style DQN architecture. "
             "Run `python train.py` to generate a fresh checkpoint."
         ) from exc
+
     model.eval()
 
     pygame.init()
     screen = pygame.display.set_mode((env.cols * TILE_SIZE, env.rows * TILE_SIZE))
     pygame.display.set_caption("Pacman DQN vs Rule-Based Ghost")
     clock = pygame.time.Clock()
+
+    # Load custom images
+    pacman_img, ghost_img = load_images()
 
     episode = 0
     state = env.reset()
@@ -105,7 +120,7 @@ def main():
         state, reward, done, info = env.step(action)
         episode_reward += reward
 
-        draw_env(screen, env)
+        draw_env(screen, env, pacman_img, ghost_img)
         pygame.display.flip()
         clock.tick(args.fps)
 
@@ -115,8 +130,10 @@ def main():
                 f"Episode {episode} finished | reward {episode_reward:7.2f} | "
                 f"pellets left {info['pellets_remaining']} | outcome {info['outcome']}"
             )
+
             if args.episodes and episode >= args.episodes:
                 break
+
             pygame.time.delay(750)
             state = env.reset()
             episode_reward = 0.0
